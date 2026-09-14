@@ -3,6 +3,7 @@ import json
 import base64
 import urllib.request
 import urllib.parse
+import random
 from datetime import datetime
 
 # ==============================================================================
@@ -39,7 +40,6 @@ if "current_user_role" not in st.session_state:
 def get_bedrock_client():
     try:
         import boto3
-        # 1. Intentar desde Streamlit Secrets
         if "AWS_ACCESS_KEY_ID" in st.secrets:
             return boto3.client(
                 service_name="bedrock-runtime",
@@ -47,7 +47,6 @@ def get_bedrock_client():
                 aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
                 aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"]
             ), "Conectado a AWS Bedrock (Secrets)"
-        # 2. Intentar entorno local
         client = boto3.client(service_name="bedrock-runtime", region_name="us-east-1")
         return client, "Conectado a AWS Bedrock (Local)"
     except Exception:
@@ -56,21 +55,34 @@ def get_bedrock_client():
 bedrock_client, bedrock_status = get_bedrock_client()
 
 # ==============================================================================
+# DICCIONARIO DE ESTILOS VISUALES MARCADOS
+# ==============================================================================
+STYLE_PROMPTS = {
+    "photographic": "hyperrealistic 8k commercial photography, award-winning studio photo, 50mm lens, sharp focus, natural lighting, professional advertising",
+    "anime": "vibrant Japanese anime style, Studio Ghibli and Makoto Shinkai aesthetic, 2D hand-drawn animation illustration, cel shaded, anime key visual, colorful, no 3D, no photograph",
+    "oil-painting": "textured classical oil painting on canvas, heavy impasto brushstrokes, rich oil paint colors, fine art museum masterpiece, visible canvas weave",
+    "digital-art": "vibrant digital fantasy concept art, trending on ArtStation, smooth lighting, volumetric glow, high quality modern digital illustration",
+    "cinematic": "cinematic movie still from a blockbuster film, dramatic anamorphic lens, shallow depth of field, atmospheric lighting, Hollywood film grading, 35mm",
+    "comic-book": "vintage comic book pop art illustration, bold black ink outlines, halftone dot pattern, retro graphic novel panel, vibrant dynamic colors"
+}
+
+# ==============================================================================
 # MÓDULO 1: GENERADOR REAL DE IMÁGENES
 # ==============================================================================
 def generate_real_image(prompt: str, style: str):
-    """Genera imágenes reales mediante AWS Bedrock o mediante motor SDXL en vivo."""
+    style_modifier = STYLE_PROMPTS.get(style, "")
+    full_prompt = f"{prompt}, {style_modifier}"
+    random_seed = random.randint(1000, 9999999)
+
     # 1. Si AWS Bedrock está disponible
     if bedrock_client:
         try:
-            # Presets válidos oficiales para SDXL en AWS Bedrock
-            valid_sdxl_presets = ["photographic", "cinematic", "anime", "digital-art", "comic-book", "fantasy-art", "analog-film"]
-            
+            valid_sdxl_presets = ["photographic", "cinematic", "anime", "digital-art", "comic-book"]
             payload = {
-                "text_prompts": [{"text": prompt, "weight": 1.0}],
-                "cfg_scale": 7.5,
-                "steps": 35,
-                "seed": 42
+                "text_prompts": [{"text": full_prompt, "weight": 1.0}],
+                "cfg_scale": 8.0,
+                "steps": 40,
+                "seed": random_seed % 2147483647
             }
             if style in valid_sdxl_presets:
                 payload["style_preset"] = style
@@ -85,19 +97,18 @@ def generate_real_image(prompt: str, style: str):
             artifacts = response_body.get("artifacts", [])
             if artifacts:
                 image_base64 = artifacts[0].get("base64")
-                return base64.b64decode(image_base64), "Amazon Bedrock (Stability SDXL)"
+                return base64.b64decode(image_base64), "Amazon Bedrock (SDXL)"
         except Exception:
-            pass  # Si las claves aún no tienen cuota o permiso, pasa al motor en vivo
+            pass
 
-    # 2. Generación directa real en vivo (Stable Diffusion / Flux)
+    # 2. Generación en vivo con motor Stable Diffusion / Flux con estilo marcado
     try:
-        enhanced_prompt = f"{prompt}, {style} style, professional commercial advertising photography, 8k resolution, highly detailed"
-        encoded = urllib.parse.quote(enhanced_prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&nologo=true&seed=123"
+        encoded = urllib.parse.quote(full_prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&nologo=true&seed={random_seed}"
         
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=40) as resp:
-            return resp.read(), "Motor Stable Diffusion en vivo"
+            return resp.read(), "Stable Diffusion / Flux en vivo"
     except Exception as e:
         return None, f"Error al generar imagen: {str(e)}"
 
@@ -126,7 +137,6 @@ def process_text_with_claude(text: str, operation: str, extra_instruction: str =
                 "system": system_prompts.get(operation, "Eres un redactor publicitario experto."),
                 "messages": [{"role": "user", "content": user_prompt}]
             })
-            # Intento con perfil de inferencia o modelo directo
             model_ids = ["us.anthropic.claude-3-5-sonnet-20240620-v1:0", "anthropic.claude-3-5-sonnet-20240620-v1:0"]
             for m_id in model_ids:
                 try:
@@ -143,9 +153,8 @@ def process_text_with_claude(text: str, operation: str, extra_instruction: str =
         except Exception:
             pass
 
-    # Modo contextual de alta calidad
     if operation == "Resumir":
-        return f"💡 **Resumen Ejecutivo:**\n{text[:130]}... [Propuesta optimizada para anuncios y redes sociales]."
+        return f"💡 **Resumen Ejecutivo:**\n{text[:130]}... [Propuesta condensada para campañas publicitarias digitales]."
     elif operation == "Expandir":
         return f"🚀 **Versión Expandida de Campaña:**\n{text}\n\nEn un mercado cada vez más competitivo, esta propuesta ofrece un valor diferencial inigualable. Cada detalle ha sido minuciosamente diseñado para superar los estándares de la industria, garantizando una experiencia de usuario memorable y sostenible. ¡Únete a la evolución hoy mismo!"
     elif operation == "Corregir estilo y gramática":
@@ -200,18 +209,18 @@ with tab_img:
         with col1:
             prompt_input = st.text_area(
                 "Descripción del arte publicitario (Prompt):",
-                value="Commercial photography of an organic eco luxury skin cream bottle, warm studio lighting, soft shadows, natural plants in background",
+                value="un girasol flotando sobre agua cristalina",
                 height=120
             )
         with col2:
             style = st.selectbox(
                 "Estilo visual:",
-                ["photographic", "cinematic", "digital-art", "anime", "fantasy-art", "comic-book"]
+                ["anime", "oil-painting", "comic-book", "digital-art", "photographic", "cinematic"]
             )
-            btn_gen = st.button("🚀 Generar Imagen Real", use_container_width=True)
+            btn_gen = st.button("🚀 Generar Imagen", use_container_width=True)
 
         if btn_gen and prompt_input:
-            with st.spinner("Generando imagen con IA... (tarda aprox. 5 a 8 segundos)"):
+            with st.spinner(f"Generando imagen en estilo {style}... (toma de 5 a 8 segundos)"):
                 img_bytes, engine_used = generate_real_image(prompt_input, style)
                 if img_bytes:
                     st.session_state.image_gallery.append({
@@ -222,7 +231,7 @@ with tab_img:
                         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "engine": engine_used
                     })
-                    st.success(f"¡Imagen generada con éxito! [{engine_used}]")
+                    st.success(f"¡Imagen generada en estilo {style.upper()}! [{engine_used}]")
                 else:
                     st.error(engine_used)
     else:
@@ -234,18 +243,18 @@ with tab_img:
         cols = st.columns(3)
         for idx, item in enumerate(reversed(st.session_state.image_gallery)):
             with cols[idx % 3]:
-                st.image(item["bytes"], caption=f"ID #{item['id']} - Estilo: {item['style']}", use_container_width=True)
+                st.image(item["bytes"], caption=f"ID #{item['id']} • Estilo: {item['style'].upper()}", use_container_width=True)
                 st.caption(f"**Prompt:** {item['prompt']}")
                 st.caption(f"*{item.get('engine', 'IA')} • {item['date']}*")
                 st.download_button(
                     label="⬇️ Descargar PNG",
                     data=item["bytes"],
-                    file_name=f"activo_{item['id']}.png",
+                    file_name=f"activo_{item['id']}_{item['style']}.png",
                     mime="image/png",
                     key=f"dl_{item['id']}"
                 )
     else:
-        st.info("Aún no hay imágenes en la galería. Haz clic en 'Generar Imagen Real' arriba.")
+        st.info("Aún no hay imágenes en la galería. Haz clic en 'Generar Imagen' arriba.")
 
 # ------------------------------------------------------------------------------
 # PESTAÑA 2: CONTENIDO Y TEXTO
