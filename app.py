@@ -4,6 +4,7 @@ import base64
 import urllib.request
 import urllib.parse
 import random
+import time
 from datetime import datetime
 
 # ==============================================================================
@@ -15,7 +16,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Inicialización de variables en Session State
 if "image_gallery" not in st.session_state:
     st.session_state.image_gallery = []
 
@@ -35,56 +35,59 @@ if "current_user_role" not in st.session_state:
     st.session_state.current_user_role = "Diseñador"
 
 # ==============================================================================
-# CONEXIÓN AMAZON BEDROCK
+# DIAGNÓSTICO Y CONEXIÓN A AWS BEDROCK
 # ==============================================================================
+has_secrets = "AWS_ACCESS_KEY_ID" in st.secrets and "AWS_SECRET_ACCESS_KEY" in st.secrets
+
 def get_bedrock_client():
     try:
         import boto3
-        if "AWS_ACCESS_KEY_ID" in st.secrets:
-            return boto3.client(
+        if has_secrets:
+            client = boto3.client(
                 service_name="bedrock-runtime",
                 region_name=st.secrets.get("AWS_DEFAULT_REGION", "us-east-1"),
                 aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
                 aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"]
-            ), "Conectado a AWS Bedrock (Secrets)"
-        client = boto3.client(service_name="bedrock-runtime", region_name="us-east-1")
-        return client, "Conectado a AWS Bedrock (Local)"
-    except Exception:
-        return None, "Modo Directo (Stable Diffusion Online)"
+            )
+            return client, "🟢 Claves detectadas en Secrets"
+        return None, "🟡 Sin claves en Secrets (Modo público)"
+    except Exception as e:
+        return None, f"🔴 Error al inicializar boto3: {str(e)}"
 
 bedrock_client, bedrock_status = get_bedrock_client()
 
 # ==============================================================================
-# DICCIONARIO DE ESTILOS VISUALES MARCADOS
+# ESTILOS VISUALES
 # ==============================================================================
 STYLE_PROMPTS = {
-    "photographic": "hyperrealistic 8k commercial photography, award-winning studio photo, 50mm lens, sharp focus, natural lighting, professional advertising",
-    "anime": "vibrant Japanese anime style, Studio Ghibli and Makoto Shinkai aesthetic, 2D hand-drawn animation illustration, cel shaded, anime key visual, colorful, no 3D, no photograph",
-    "oil-painting": "textured classical oil painting on canvas, heavy impasto brushstrokes, rich oil paint colors, fine art museum masterpiece, visible canvas weave",
-    "digital-art": "vibrant digital fantasy concept art, trending on ArtStation, smooth lighting, volumetric glow, high quality modern digital illustration",
-    "cinematic": "cinematic movie still from a blockbuster film, dramatic anamorphic lens, shallow depth of field, atmospheric lighting, Hollywood film grading, 35mm",
-    "comic-book": "vintage comic book pop art illustration, bold black ink outlines, halftone dot pattern, retro graphic novel panel, vibrant dynamic colors"
+    "photographic": "hyperrealistic 8k commercial photography, award-winning studio photo, sharp focus, natural lighting",
+    "anime": "vibrant Japanese anime style, Studio Ghibli aesthetic, 2D animation illustration, cel shaded, colorful, no 3D",
+    "oil-painting": "textured classical oil painting on canvas, heavy impasto brushstrokes, fine art museum masterpiece",
+    "digital-art": "vibrant digital fantasy concept art, trending on ArtStation, smooth volumetric glow, modern illustration",
+    "cinematic": "cinematic movie still, dramatic atmospheric lighting, Hollywood color grading, 35mm film",
+    "comic-book": "vintage comic book pop art illustration, bold black ink outlines, halftone dot pattern, retro graphic novel"
 }
 
 # ==============================================================================
-# MÓDULO 1: GENERADOR REAL DE IMÁGENES
+# GENERADOR DE IMÁGENES CON DIAGNÓSTICO TRANSPARENTE
 # ==============================================================================
 def generate_real_image(prompt: str, style: str):
     style_modifier = STYLE_PROMPTS.get(style, "")
     full_prompt = f"{prompt}, {style_modifier}"
     random_seed = random.randint(1000, 9999999)
 
-    # 1. Si AWS Bedrock está disponible
+    # 1. Si hay cliente de Bedrock configurado, intentamos invocarlo
     if bedrock_client:
         try:
-            valid_sdxl_presets = ["photographic", "cinematic", "anime", "digital-art", "comic-book"]
             payload = {
                 "text_prompts": [{"text": full_prompt, "weight": 1.0}],
                 "cfg_scale": 8.0,
-                "steps": 40,
+                "steps": 35,
                 "seed": random_seed % 2147483647
             }
-            if style in valid_sdxl_presets:
+            # Presets válidos en AWS Bedrock SDXL
+            valid_sdxl = ["photographic", "cinematic", "anime", "digital-art", "comic-book"]
+            if style in valid_sdxl:
                 payload["style_preset"] = style
 
             response = bedrock_client.invoke_model(
@@ -97,30 +100,35 @@ def generate_real_image(prompt: str, style: str):
             artifacts = response_body.get("artifacts", [])
             if artifacts:
                 image_base64 = artifacts[0].get("base64")
-                return base64.b64decode(image_base64), "Amazon Bedrock (SDXL)"
-        except Exception:
-            pass
+                return base64.b64decode(image_base64), "Amazon Bedrock (SDXL Oficial)"
+        except Exception as e:
+            st.error(f"⚠️ AWS Bedrock devolvió este error: {str(e)}")
+            st.info("Intentando generar mediante el motor secundario...")
 
-    # 2. Generación en vivo con motor Stable Diffusion / Flux con estilo marcado
+    # 2. Motor secundario con tolerancia a saturación
+    encoded = urllib.parse.quote(full_prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&model=turbo&nologo=true&seed={random_seed}"
+    
     try:
-        encoded = urllib.parse.quote(full_prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&nologo=true&seed={random_seed}"
-        
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            return resp.read(), "Stable Diffusion / Flux en vivo"
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            return resp.read(), "Motor Stable Diffusion en vivo"
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return None, "Error 429: El servidor libre está saturado temporalmente. Espera 20 segundos para volver a presionar el botón."
+        return None, f"Error HTTP: {str(e)}"
     except Exception as e:
-        return None, f"Error al generar imagen: {str(e)}"
+        return None, f"Error al generar: {str(e)}"
 
 # ==============================================================================
-# MÓDULO 2: EDICIÓN DE TEXTO Y CONTENIDO (CLAUDE)
+# MÓDULO 2: EDICIÓN DE CONTENIDO (CLAUDE)
 # ==============================================================================
 def process_text_with_claude(text: str, operation: str, extra_instruction: str = ""):
     system_prompts = {
-        "Resumir": "Eres un redactor publicitario senior. Resume el texto destacando la propuesta de valor clave en un formato conciso y persuasivo.",
-        "Expandir": "Eres un redactor creativo senior. Desarrolla las ideas proporcionando argumentos comerciales convincentes, llamado a la acción (CTA) y tono envolvente.",
-        "Corregir estilo y gramática": "Eres un editor editorial profesional. Corrige errores gramaticales, fluidez y tono profesional sin perder el mensaje esencial.",
-        "Generar variaciones de Copy (A/B)": "Eres especialista en conversión publicitaria. Genera 3 variaciones de copy: 1) Emocional, 2) Enfoque en beneficios, 3) Directa con llamado a la acción."
+        "Resumir": "Eres un redactor publicitario senior. Resume el texto destacando la propuesta de valor clave en un formato conciso.",
+        "Expandir": "Eres un redactor creativo senior. Desarrolla las ideas proporcionando argumentos comerciales convincentes.",
+        "Corregir estilo y gramática": "Eres un editor editorial profesional. Corrige errores gramaticales y mejora la fluidez.",
+        "Generar variaciones de Copy (A/B)": "Eres especialista en conversión. Genera 3 variaciones de copy: 1) Emocional, 2) Beneficios, 3) Directa."
     }
 
     user_prompt = f"Texto base:\n\"\"\"\n{text}\n\"\"\"\n"
@@ -154,16 +162,16 @@ def process_text_with_claude(text: str, operation: str, extra_instruction: str =
             pass
 
     if operation == "Resumir":
-        return f"💡 **Resumen Ejecutivo:**\n{text[:130]}... [Propuesta condensada para campañas publicitarias digitales]."
+        return f"💡 **Resumen:** {text[:130]}... [Propuesta condensada]."
     elif operation == "Expandir":
-        return f"🚀 **Versión Expandida de Campaña:**\n{text}\n\nEn un mercado cada vez más competitivo, esta propuesta ofrece un valor diferencial inigualable. Cada detalle ha sido minuciosamente diseñado para superar los estándares de la industria, garantizando una experiencia de usuario memorable y sostenible. ¡Únete a la evolución hoy mismo!"
+        return f"🚀 **Versión Expandida:** {text}\n\nDiseñado para destacar en un mercado exigente con la mayor durabilidad y sostenibilidad comprobada. ¡Conócelo hoy!"
     elif operation == "Corregir estilo y gramática":
-        return f"✨ **Versión Estilizada:**\n{text.strip().capitalize()} Hemos optimizado la cadencia, tono de voz y precisión sintáctica para maximizar el engagement comercial."
+        return f"✨ **Versión Corregida:** {text.strip().capitalize()} Optimizado para claridad y estilo formal."
     else:
-        return f"📊 **Variaciones de Copy para Pruebas A/B:**\n\n- **Opción A (Emocional):** Siente el orgullo de elegir lo mejor para ti y tu entorno cada día.\n- **Opción B (Racional / Beneficios):** 100% de efectividad con un ahorro medible desde la primera semana.\n- **Opción C (Urgencia / Call to Action):** La oportunidad de transformar tu rutina está aquí. ¡Pruébalo hoy!"
+        return f"📊 **Variaciones de Copy:**\n\n- **A (Emocional):** Siente el cambio positivo en cada uso.\n- **B (Racional):** Ahorra tiempo y recursos con eficacia comprobada.\n- **C (Directa):** Ordena ahora y obtén beneficios exclusivos."
 
 # ==============================================================================
-# SIDEBAR: CONTROL DE ROLES (RBAC) Y PARÁMETROS
+# SIDEBAR
 # ==============================================================================
 with st.sidebar:
     st.title("🛡️ Gestión de Acceso")
@@ -173,24 +181,20 @@ with st.sidebar:
     )
     role = st.session_state.current_user_role
     
-    st.info(f"**Permisos actuales ({role}):**")
-    if role == "Diseñador":
-        st.write("- Generación visual con Stable Diffusion\n- Consulta y descarga de galería\n- Agregar notas creativas")
-    elif role == "Redactor":
-        st.write("- Transformación de contenido con Claude\n- Control de versiones y rollback\n- Agregar comentarios")
-    elif role == "Aprobador":
-        st.write("- Revisión integral de activos\n- Aprobación/Rechazo de campañas\n- Publicación final")
+    st.markdown("---")
+    st.subheader("📡 Conexión AWS Bedrock")
+    if has_secrets:
+        st.success(bedrock_status)
     else:
-        st.write("- Acceso integral a todas las funciones y auditoría de seguridad.")
+        st.warning(bedrock_status)
+        st.caption("Ve a Settings > Secrets en Streamlit Cloud para conectar tus claves de AWS.")
 
     st.markdown("---")
-    st.caption(f"**Motor IA:** {bedrock_status}")
-    st.subheader("⚙️ Parámetros de Inferencia")
-    temperature = st.slider("Temperatura (Creatividad Claude):", 0.0, 1.0, 0.7, 0.05)
-    st.caption("0.0 - 0.3: Determinista | 0.7 - 1.0: Creativo")
+    st.subheader("⚙️ Parámetros")
+    temperature = st.slider("Temperatura Claude:", 0.0, 1.0, 0.7, 0.05)
 
 # ==============================================================================
-# VISTA PRINCIPAL POR PESTAÑAS
+# PESTAÑAS PRINCIPALES
 # ==============================================================================
 tab_img, tab_txt, tab_collab, tab_sec = st.tabs([
     "🖼️ Generador de Imágenes",
@@ -199,17 +203,15 @@ tab_img, tab_txt, tab_collab, tab_sec = st.tabs([
     "🔒 Ética y Seguridad"
 ])
 
-# ------------------------------------------------------------------------------
-# PESTAÑA 1: IMÁGENES
-# ------------------------------------------------------------------------------
+# Pestaña 1: Imágenes
 with tab_img:
     st.header("Generación de Activos Visuales (Stable Diffusion)")
     if role in ["Diseñador", "Administrador"]:
         col1, col2 = st.columns(2)
         with col1:
             prompt_input = st.text_area(
-                "Descripción del arte publicitario (Prompt):",
-                value="un girasol flotando sobre agua cristalina",
+                "Prompt del arte publicitario:",
+                value="un girasol flotando sobre agua cristalina vista cenital",
                 height=120
             )
         with col2:
@@ -220,7 +222,7 @@ with tab_img:
             btn_gen = st.button("🚀 Generar Imagen", use_container_width=True)
 
         if btn_gen and prompt_input:
-            with st.spinner(f"Generando imagen en estilo {style}... (toma de 5 a 8 segundos)"):
+            with st.spinner(f"Generando en estilo {style.upper()}..."):
                 img_bytes, engine_used = generate_real_image(prompt_input, style)
                 if img_bytes:
                     st.session_state.image_gallery.append({
@@ -231,11 +233,11 @@ with tab_img:
                         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "engine": engine_used
                     })
-                    st.success(f"¡Imagen generada en estilo {style.upper()}! [{engine_used}]")
+                    st.success(f"¡Imagen creada! [{engine_used}]")
                 else:
                     st.error(engine_used)
     else:
-        st.warning("⚠️ Su rol actual no posee permisos de creación gráfica. Puede explorar la galería y descargar activos.")
+        st.warning("⚠️ Tu rol actual no tiene permisos de diseño.")
 
     st.markdown("---")
     st.subheader("📚 Galería de Activos Generados")
@@ -254,16 +256,13 @@ with tab_img:
                     key=f"dl_{item['id']}"
                 )
     else:
-        st.info("Aún no hay imágenes en la galería. Haz clic en 'Generar Imagen' arriba.")
+        st.info("Galería vacía.")
 
-# ------------------------------------------------------------------------------
-# PESTAÑA 2: CONTENIDO Y TEXTO
-# ------------------------------------------------------------------------------
+# Pestaña 2: Contenido
 with tab_txt:
     st.header("Edición y Optimización de Copy (Claude 3.5 Sonnet)")
     if role in ["Redactor", "Administrador"]:
         current_text = st.session_state.text_history[-1]["content"]
-        
         c_left, c_right = st.columns(2)
         with c_left:
             st.subheader("Borrador Activo")
@@ -272,9 +271,9 @@ with tab_txt:
                 "Acción de transformación creativa:",
                 ["Resumir", "Expandir", "Corregir estilo y gramática", "Generar variaciones de Copy (A/B)"]
             )
-            extra_instructions = st.text_input("Instrucciones específicas (opcional):", placeholder="Ej. Tono formal para audiencia B2B")
+            extra_instructions = st.text_input("Instrucciones específicas (opcional):", placeholder="Ej. Enfoque sustentable")
             if st.button("✨ Aplicar Transformación con Claude", use_container_width=True):
-                with st.spinner("Procesando texto con IA..."):
+                with st.spinner("Procesando texto..."):
                     result_text = process_text_with_claude(input_text, op, extra_instructions)
                     st.session_state.text_history.append({
                         "version": len(st.session_state.text_history) + 1,
@@ -294,10 +293,8 @@ with tab_txt:
                 index=len(history) - 1,
                 format_func=lambda x: f"Versión {x} ({history[x-1]['action']})"
             )
-            
             v_content = history[selected_version - 1]["content"]
             st.text_area("Contenido de la versión seleccionada:", value=v_content, height=180, disabled=True)
-            
             if selected_version != len(history):
                 if st.button(f"⏪ Revertir a Versión {selected_version}", use_container_width=True):
                     st.session_state.text_history.append({
@@ -307,17 +304,14 @@ with tab_txt:
                         "action": f"Rollback a Versión {selected_version}",
                         "content": v_content
                     })
-                    st.success(f"Restaurada la Versión {selected_version} exitosamente.")
+                    st.success(f"Restaurada Versión {selected_version}.")
                     st.rerun()
     else:
-        st.warning("⚠️ Su rol actual solo tiene permisos de lectura para el editor de textos.")
+        st.warning("⚠️ Tu rol no tiene permisos de redacción.")
 
-# ------------------------------------------------------------------------------
-# PESTAÑA 3: COLABORACIÓN Y FLUJO DE TRABAJO
-# ------------------------------------------------------------------------------
+# Pestaña 3: Colaboración
 with tab_collab:
     st.header("Flujo de Aprobaciones y Retroalimentación")
-    
     st.subheader("Estado de la Campaña")
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Activos Gráficos", len(st.session_state.image_gallery))
@@ -327,8 +321,7 @@ with tab_collab:
 
     st.markdown("---")
     st.subheader("Muro de Notas y Comentarios del Equipo")
-    new_comment = st.text_input("Agregar nota o retroalimentación:")
-    
+    new_comment = st.text_input("Agregar nota:")
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("💬 Publicar Comentario"):
@@ -356,28 +349,12 @@ with tab_collab:
             st.markdown(f"**{note['author']}** ({note['date']}) - *[{note['status']}]*")
             st.write(note["text"])
 
-# ------------------------------------------------------------------------------
-# PESTAÑA 4: ÉTICA Y SEGURIDAD
-# ------------------------------------------------------------------------------
+# Pestaña 4: Ética y Seguridad
 with tab_sec:
     st.header("Gobierno, Seguridad y Ética en IA Generativa")
-    
     st.subheader("1. Bedrock Guardrails y Moderación")
-    st.markdown("""
-    - **Filtro de Contenido Tóxico:** Bloqueo de lenguaje inapropiado, ofensivo o engañoso en copys e imágenes.
-    - **Enmascaramiento de PII:** Detección de datos personales sensibles (correos, teléfonos, tarjetas bancarias).
-    - **Detección de Prompt Injection:** Protección contra inyecciones directas e indirectas de prompts.
-    """)
-
+    st.markdown("- **Filtro de Contenido Tóxico:** Bloqueo de lenguaje inapropiado y ofensivo.\n- **Enmascaramiento de PII:** Detección y bloqueo de datos sensibles.\n- **Detección de Prompt Injection:** Protección contra inyecciones directas.")
     st.subheader("2. Cifrado y Privacidad Corporativa")
-    st.markdown("""
-    - **En reposo:** Almacenamiento en Amazon S3 cifrado con llaves administradas en **AWS KMS**.
-    - **En tránsito:** Protocolos seguros TLS 1.3 en todas las conexiones y APIs.
-    - **Soberanía:** Los datos empresariales no son utilizados para el entrenamiento de modelos fundacionales.
-    """)
-
+    st.markdown("- **En reposo:** Cifrado en S3 mediante AWS KMS.\n- **En tránsito:** Protocolos TLS 1.3 forzados.\n- **Soberanía:** Los datos no se usan para re-entrenar modelos.")
     st.subheader("3. Derechos de Autor y Mitigación de Sesgos")
-    st.markdown("""
-    - **Trazabilidad C2PA:** Credenciales de procedencia de contenido para certificar imágenes generadas por IA.
-    - **Mitigación de Sesgos:** Directrices en el *System Prompt* de Claude para equilibrar representaciones socioculturales en las campañas.
-    """)
+    st.markdown("- **Trazabilidad C2PA:** Marcas de agua y credenciales de contenido.\n- **Mitigación de Sesgos:** Directrices en system prompts para balance sociocultural.")
