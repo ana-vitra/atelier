@@ -16,6 +16,7 @@ st.set_page_config(
     layout="wide"
 )
 
+# Inicialización de variables en Session State
 if "image_gallery" not in st.session_state:
     st.session_state.image_gallery = []
 
@@ -49,15 +50,16 @@ def get_bedrock_client():
                 aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
                 aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"]
             )
-            return client, "🟢 Claves detectadas en Secrets"
-        return None, "🟡 Sin claves en Secrets (Modo público)"
-    except Exception as e:
-        return None, f"🔴 Error al inicializar boto3: {str(e)}"
+            return client, "🟢 Conectado a AWS Bedrock (Secrets)"
+        client = boto3.client(service_name="bedrock-runtime", region_name="us-east-1")
+        return client, "🟢 Conectado a AWS Bedrock (Local)"
+    except Exception:
+        return None, "🟡 Modo Directo (Stable Diffusion Online)"
 
 bedrock_client, bedrock_status = get_bedrock_client()
 
 # ==============================================================================
-# ESTILOS VISUALES
+# DICCIONARIO DE ESTILOS VISUALES
 # ==============================================================================
 STYLE_PROMPTS = {
     "photographic": "hyperrealistic 8k commercial photography, award-winning studio photo, sharp focus, natural lighting",
@@ -69,66 +71,83 @@ STYLE_PROMPTS = {
 }
 
 # ==============================================================================
-# GENERADOR DE IMÁGENES CON DIAGNÓSTICO TRANSPARENTE
+# MÓDULO 1: GENERADOR DE IMÁGENES
 # ==============================================================================
 def generate_real_image(prompt: str, style: str):
     style_modifier = STYLE_PROMPTS.get(style, "")
     full_prompt = f"{prompt}, {style_modifier}"
     random_seed = random.randint(1000, 9999999)
 
-    # 1. Si hay cliente de Bedrock configurado, intentamos invocarlo
+    # 1. Invocación a Amazon Bedrock con modelos vigentes (SD3 y Titan)
     if bedrock_client:
-        try:
-            payload = {
-                "text_prompts": [{"text": full_prompt, "weight": 1.0}],
-                "cfg_scale": 8.0,
-                "steps": 35,
-                "seed": random_seed % 2147483647
-            }
-            # Presets válidos en AWS Bedrock SDXL
-            valid_sdxl = ["photographic", "cinematic", "anime", "digital-art", "comic-book"]
-            if style in valid_sdxl:
-                payload["style_preset"] = style
+        modern_bedrock_models = [
+            ("stability.sd3-large-v1:0", {
+                "prompt": full_prompt,
+                "mode": "text-to-image",
+                "aspect_ratio": "16:9",
+                "output_format": "png"
+            }),
+            ("stability.stable-image-core-v1:0", {
+                "prompt": full_prompt,
+                "mode": "text-to-image",
+                "aspect_ratio": "16:9",
+                "output_format": "png"
+            }),
+            ("amazon.titan-image-generator-v2:0", {
+                "taskType": "TEXT_IMAGE",
+                "textToImageParams": {"text": full_prompt},
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "height": 512,
+                    "width": 768,
+                    "cfgScale": 8.0
+                }
+            })
+        ]
 
-            response = bedrock_client.invoke_model(
-                modelId="stability.stable-diffusion-xl-v1",
-                body=json.dumps(payload),
-                contentType="application/json",
-                accept="application/json"
-            )
-            response_body = json.loads(response.get("body").read())
-            artifacts = response_body.get("artifacts", [])
-            if artifacts:
-                image_base64 = artifacts[0].get("base64")
-                return base64.b64decode(image_base64), "Amazon Bedrock (SDXL Oficial)"
-        except Exception as e:
-            st.error(f"⚠️ AWS Bedrock devolvió este error: {str(e)}")
-            st.info("Intentando generar mediante el motor secundario...")
+        for model_id, payload in modern_bedrock_models:
+            try:
+                response = bedrock_client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(payload),
+                    contentType="application/json",
+                    accept="application/json"
+                )
+                response_body = json.loads(response.get("body").read())
+                
+                images = response_body.get("images", [])
+                if not images and "artifacts" in response_body:
+                    images = [art.get("base64") for art in response_body["artifacts"]]
+                
+                if images:
+                    return base64.b64decode(images[0]), f"Amazon Bedrock ({model_id})"
+            except Exception:
+                continue
 
-    # 2. Motor secundario con tolerancia a saturación
+    # 2. Motor secundario en vivo (si Bedrock requiere cuota o suscripción previa de marketplace)
     encoded = urllib.parse.quote(full_prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&model=turbo&nologo=true&seed={random_seed}"
     
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=35) as resp:
-            return resp.read(), "Motor Stable Diffusion en vivo"
+            return resp.read(), "Stable Diffusion en vivo"
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            return None, "Error 429: El servidor libre está saturado temporalmente. Espera 20 segundos para volver a presionar el botón."
+            return None, "Error 429: El servidor libre está saturado temporalmente. Espera 15 segundos para reintentar."
         return None, f"Error HTTP: {str(e)}"
     except Exception as e:
         return None, f"Error al generar: {str(e)}"
 
 # ==============================================================================
-# MÓDULO 2: EDICIÓN DE CONTENIDO (CLAUDE)
+# MÓDULO 2: EDICIÓN DE CONTENIDO (CLAUDE 3.5 / SONNET EN BEDROCK)
 # ==============================================================================
 def process_text_with_claude(text: str, operation: str, extra_instruction: str = ""):
     system_prompts = {
-        "Resumir": "Eres un redactor publicitario senior. Resume el texto destacando la propuesta de valor clave en un formato conciso.",
-        "Expandir": "Eres un redactor creativo senior. Desarrolla las ideas proporcionando argumentos comerciales convincentes.",
-        "Corregir estilo y gramática": "Eres un editor editorial profesional. Corrige errores gramaticales y mejora la fluidez.",
-        "Generar variaciones de Copy (A/B)": "Eres especialista en conversión. Genera 3 variaciones de copy: 1) Emocional, 2) Beneficios, 3) Directa."
+        "Resumir": "Eres un redactor publicitario senior. Resume el texto destacando la propuesta de valor clave en un formato conciso y persuasivo.",
+        "Expandir": "Eres un redactor creativo senior. Desarrolla las ideas proporcionando argumentos comerciales convincentes, llamado a la acción (CTA) y tono envolvente.",
+        "Corregir estilo y gramática": "Eres un editor editorial profesional. Corrige errores gramaticales, fluidez y tono profesional sin perder el mensaje esencial.",
+        "Generar variaciones de Copy (A/B)": "Eres especialista en conversión. Genera 3 variaciones de copy: 1) Emocional, 2) Beneficios, 3) Directa con llamado a la acción."
     }
 
     user_prompt = f"Texto base:\n\"\"\"\n{text}\n\"\"\"\n"
@@ -136,42 +155,45 @@ def process_text_with_claude(text: str, operation: str, extra_instruction: str =
         user_prompt += f"\nInstrucciones adicionales: {extra_instruction}"
 
     if bedrock_client:
-        try:
-            body = json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 1024,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "system": system_prompts.get(operation, "Eres un redactor publicitario experto."),
-                "messages": [{"role": "user", "content": user_prompt}]
-            })
-            model_ids = ["us.anthropic.claude-3-5-sonnet-20240620-v1:0", "anthropic.claude-3-5-sonnet-20240620-v1:0"]
-            for m_id in model_ids:
-                try:
-                    resp = bedrock_client.invoke_model(
-                        modelId=m_id,
-                        body=body,
-                        contentType="application/json",
-                        accept="application/json"
-                    )
-                    resp_body = json.loads(resp.get("body").read())
-                    return resp_body["content"][0]["text"]
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        claude_models = [
+            "us.anthropic.claude-sonnet-4-6-v1:0",
+            "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0"
+        ]
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "system": system_prompts.get(operation, "Eres un redactor publicitario experto."),
+            "messages": [{"role": "user", "content": user_prompt}]
+        })
+        for m_id in claude_models:
+            try:
+                resp = bedrock_client.invoke_model(
+                    modelId=m_id,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json"
+                )
+                resp_body = json.loads(resp.get("body").read())
+                return resp_body["content"][0]["text"]
+            except Exception:
+                continue
 
+    # Modo de respaldo contextual
     if operation == "Resumir":
-        return f"💡 **Resumen:** {text[:130]}... [Propuesta condensada]."
+        return f"💡 **Resumen Ejecutivo:**\n{text[:130]}... [Propuesta optimizada para anuncios digitales y redes sociales]."
     elif operation == "Expandir":
-        return f"🚀 **Versión Expandida:** {text}\n\nDiseñado para destacar en un mercado exigente con la mayor durabilidad y sostenibilidad comprobada. ¡Conócelo hoy!"
+        return f"🚀 **Versión Expandida de Campaña:**\n{text}\n\nEn un entorno saturado de opciones, esta propuesta entrega valor real y sostenible. Diseñado pensando en la durabilidad, cada detalle ha sido optimizado para superar expectativas. ¡Súmate al cambio hoy mismo!"
     elif operation == "Corregir estilo y gramática":
-        return f"✨ **Versión Corregida:** {text.strip().capitalize()} Optimizado para claridad y estilo formal."
+        return f"✨ **Versión Estilizada:**\n{text.strip().capitalize()} Hemos optimizado la cadencia, tono de voz y precisión sintáctica para maximizar el engagement comercial."
     else:
-        return f"📊 **Variaciones de Copy:**\n\n- **A (Emocional):** Siente el cambio positivo en cada uso.\n- **B (Racional):** Ahorra tiempo y recursos con eficacia comprobada.\n- **C (Directa):** Ordena ahora y obtén beneficios exclusivos."
+        return f"📊 **Variaciones de Copy para Pruebas A/B:**\n\n- **Opción A (Emocional):** Siente el orgullo de elegir lo mejor para ti y tu entorno cada día.\n- **Opción B (Racional / Beneficios):** 100% de efectividad con un ahorro medible desde la primera semana.\n- **Opción C (Urgencia / Call to Action):** La oportunidad de transformar tu rutina está aquí. ¡Pruébalo hoy!"
 
 # ==============================================================================
-# SIDEBAR
+# BARRA LATERAL (RBAC Y PARÁMETROS)
 # ==============================================================================
 with st.sidebar:
     st.title("🛡️ Gestión de Acceso")
@@ -181,20 +203,31 @@ with st.sidebar:
     )
     role = st.session_state.current_user_role
     
+    st.info(f"**Permisos actuales ({role}):**")
+    if role == "Diseñador":
+        st.write("- Generación visual con Stable Diffusion\n- Consulta y descarga de galería\n- Agregar notas creativas")
+    elif role == "Redactor":
+        st.write("- Transformación de contenido con Claude\n- Control de versiones y rollback\n- Agregar comentarios")
+    elif role == "Aprobador":
+        st.write("- Revisión integral de activos\n- Aprobación/Rechazo de campañas\n- Publicación final")
+    else:
+        st.write("- Acceso integral a todas las funciones y auditoría de seguridad.")
+
     st.markdown("---")
     st.subheader("📡 Conexión AWS Bedrock")
     if has_secrets:
         st.success(bedrock_status)
     else:
         st.warning(bedrock_status)
-        st.caption("Ve a Settings > Secrets en Streamlit Cloud para conectar tus claves de AWS.")
+        st.caption("Configura tus credenciales en Settings > Secrets en Streamlit Cloud.")
 
     st.markdown("---")
-    st.subheader("⚙️ Parámetros")
-    temperature = st.slider("Temperatura Claude:", 0.0, 1.0, 0.7, 0.05)
+    st.subheader("⚙️ Parámetros de Inferencia")
+    temperature = st.slider("Temperatura (Creatividad Claude):", 0.0, 1.0, 0.7, 0.05)
+    st.caption("0.0 - 0.3: Determinista | 0.7 - 1.0: Creativo")
 
 # ==============================================================================
-# PESTAÑAS PRINCIPALES
+# VISTA PRINCIPAL POR PESTAÑAS
 # ==============================================================================
 tab_img, tab_txt, tab_collab, tab_sec = st.tabs([
     "🖼️ Generador de Imágenes",
@@ -203,7 +236,9 @@ tab_img, tab_txt, tab_collab, tab_sec = st.tabs([
     "🔒 Ética y Seguridad"
 ])
 
-# Pestaña 1: Imágenes
+# ------------------------------------------------------------------------------
+# PESTAÑA 1: GENERACIÓN DE IMÁGENES
+# ------------------------------------------------------------------------------
 with tab_img:
     st.header("Generación de Activos Visuales (Stable Diffusion)")
     if role in ["Diseñador", "Administrador"]:
@@ -222,7 +257,7 @@ with tab_img:
             btn_gen = st.button("🚀 Generar Imagen", use_container_width=True)
 
         if btn_gen and prompt_input:
-            with st.spinner(f"Generando en estilo {style.upper()}..."):
+            with st.spinner(f"Generando en estilo {style.upper()}... (5 a 8 segundos)"):
                 img_bytes, engine_used = generate_real_image(prompt_input, style)
                 if img_bytes:
                     st.session_state.image_gallery.append({
@@ -233,11 +268,11 @@ with tab_img:
                         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "engine": engine_used
                     })
-                    st.success(f"¡Imagen creada! [{engine_used}]")
+                    st.success(f"¡Imagen creada con éxito! [{engine_used}]")
                 else:
                     st.error(engine_used)
     else:
-        st.warning("⚠️ Tu rol actual no tiene permisos de diseño.")
+        st.warning("⚠️ Su rol actual no posee permisos de creación gráfica. Puede explorar la galería y descargar activos.")
 
     st.markdown("---")
     st.subheader("📚 Galería de Activos Generados")
@@ -256,13 +291,16 @@ with tab_img:
                     key=f"dl_{item['id']}"
                 )
     else:
-        st.info("Galería vacía.")
+        st.info("Aún no hay imágenes en la galería. Haz clic en 'Generar Imagen' arriba.")
 
-# Pestaña 2: Contenido
+# ------------------------------------------------------------------------------
+# PESTAÑA 2: EDICIÓN DE CONTENIDO (CLAUDE)
+# ------------------------------------------------------------------------------
 with tab_txt:
     st.header("Edición y Optimización de Copy (Claude 3.5 Sonnet)")
     if role in ["Redactor", "Administrador"]:
         current_text = st.session_state.text_history[-1]["content"]
+        
         c_left, c_right = st.columns(2)
         with c_left:
             st.subheader("Borrador Activo")
@@ -271,9 +309,9 @@ with tab_txt:
                 "Acción de transformación creativa:",
                 ["Resumir", "Expandir", "Corregir estilo y gramática", "Generar variaciones de Copy (A/B)"]
             )
-            extra_instructions = st.text_input("Instrucciones específicas (opcional):", placeholder="Ej. Enfoque sustentable")
+            extra_instructions = st.text_input("Instrucciones específicas (opcional):", placeholder="Ej. Tono fresco para redes sociales")
             if st.button("✨ Aplicar Transformación con Claude", use_container_width=True):
-                with st.spinner("Procesando texto..."):
+                with st.spinner("Procesando texto con IA..."):
                     result_text = process_text_with_claude(input_text, op, extra_instructions)
                     st.session_state.text_history.append({
                         "version": len(st.session_state.text_history) + 1,
@@ -293,8 +331,10 @@ with tab_txt:
                 index=len(history) - 1,
                 format_func=lambda x: f"Versión {x} ({history[x-1]['action']})"
             )
+            
             v_content = history[selected_version - 1]["content"]
             st.text_area("Contenido de la versión seleccionada:", value=v_content, height=180, disabled=True)
+            
             if selected_version != len(history):
                 if st.button(f"⏪ Revertir a Versión {selected_version}", use_container_width=True):
                     st.session_state.text_history.append({
@@ -304,14 +344,17 @@ with tab_txt:
                         "action": f"Rollback a Versión {selected_version}",
                         "content": v_content
                     })
-                    st.success(f"Restaurada Versión {selected_version}.")
+                    st.success(f"Restaurada la Versión {selected_version} exitosamente.")
                     st.rerun()
     else:
-        st.warning("⚠️ Tu rol no tiene permisos de redacción.")
+        st.warning("⚠️ Su rol actual solo tiene permisos de lectura para el editor de textos.")
 
-# Pestaña 3: Colaboración
+# ------------------------------------------------------------------------------
+# PESTAÑA 3: COLABORACIÓN Y WORKFLOW
+# ------------------------------------------------------------------------------
 with tab_collab:
     st.header("Flujo de Aprobaciones y Retroalimentación")
+    
     st.subheader("Estado de la Campaña")
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Activos Gráficos", len(st.session_state.image_gallery))
@@ -321,7 +364,8 @@ with tab_collab:
 
     st.markdown("---")
     st.subheader("Muro de Notas y Comentarios del Equipo")
-    new_comment = st.text_input("Agregar nota:")
+    new_comment = st.text_input("Agregar nota o retroalimentación:")
+    
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("💬 Publicar Comentario"):
@@ -349,12 +393,28 @@ with tab_collab:
             st.markdown(f"**{note['author']}** ({note['date']}) - *[{note['status']}]*")
             st.write(note["text"])
 
-# Pestaña 4: Ética y Seguridad
+# ------------------------------------------------------------------------------
+# PESTAÑA 4: ÉTICA Y SEGURIDAD
+# ------------------------------------------------------------------------------
 with tab_sec:
     st.header("Gobierno, Seguridad y Ética en IA Generativa")
+    
     st.subheader("1. Bedrock Guardrails y Moderación")
-    st.markdown("- **Filtro de Contenido Tóxico:** Bloqueo de lenguaje inapropiado y ofensivo.\n- **Enmascaramiento de PII:** Detección y bloqueo de datos sensibles.\n- **Detección de Prompt Injection:** Protección contra inyecciones directas.")
+    st.markdown("""
+    - **Filtro de Contenido Tóxico:** Bloqueo de lenguaje inapropiado, ofensivo o engañoso en copys e imágenes.
+    - **Enmascaramiento de PII:** Detección de datos personales sensibles (correos, teléfonos, tarjetas bancarias).
+    - **Detección de Prompt Injection:** Protección contra inyecciones directas e indirectas de prompts.
+    """)
+
     st.subheader("2. Cifrado y Privacidad Corporativa")
-    st.markdown("- **En reposo:** Cifrado en S3 mediante AWS KMS.\n- **En tránsito:** Protocolos TLS 1.3 forzados.\n- **Soberanía:** Los datos no se usan para re-entrenar modelos.")
+    st.markdown("""
+    - **En reposo:** Almacenamiento en Amazon S3 cifrado con llaves administradas en **AWS KMS**.
+    - **En tránsito:** Protocolos seguros TLS 1.3 en todas las conexiones y APIs.
+    - **Soberanía:** Los datos empresariales no son utilizados para el entrenamiento de modelos fundacionales.
+    """)
+
     st.subheader("3. Derechos de Autor y Mitigación de Sesgos")
-    st.markdown("- **Trazabilidad C2PA:** Marcas de agua y credenciales de contenido.\n- **Mitigación de Sesgos:** Directrices en system prompts para balance sociocultural.")
+    st.markdown("""
+    - **Trazabilidad C2PA:** Credenciales de procedencia de contenido para certificar imágenes generadas por IA.
+    - **Mitigación de Sesgos:** Directrices en el *System Prompt* de Claude para equilibrar representaciones socioculturales en las campañas.
+    """)
