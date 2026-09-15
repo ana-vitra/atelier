@@ -71,30 +71,30 @@ STYLE_PROMPTS = {
 }
 
 # ==============================================================================
-# MÓDULO 1: GENERADOR DE IMÁGENES (AMAZON BEDROCK DIRECTO)
+# MÓDULO 1: GENERADOR DE IMÁGENES (AMAZON BEDROCK NOVA CANVAS)
 # ==============================================================================
 def generate_real_image(prompt: str, style: str):
     style_modifier = STYLE_PROMPTS.get(style, "")
     full_prompt = f"{prompt}, {style_modifier}"
     random_seed = random.randint(1000, 9999999)
 
-    # 1. Llamada a Amazon Bedrock (Titan Image Generator v2 en us-east-1)
+    # 1. Llamada al motor vigente de AWS Bedrock: Amazon Nova Canvas
     if bedrock_client:
         try:
             payload = {
                 "taskType": "TEXT_IMAGE",
                 "textToImageParams": {
-                    "text": full_prompt[:512]  # Límite admitido por Titan
+                    "text": full_prompt[:512]
                 },
                 "imageGenerationConfig": {
                     "numberOfImages": 1,
                     "height": 512,
-                    "width": 512,  # Resolución exacta requerida por Titan
+                    "width": 512,
                     "cfgScale": 8.0
                 }
             }
             response = bedrock_client.invoke_model(
-                modelId="amazon.titan-image-generator-v2:0",
+                modelId="amazon.nova-canvas-v1:0",
                 body=json.dumps(payload),
                 contentType="application/json",
                 accept="application/json"
@@ -102,11 +102,11 @@ def generate_real_image(prompt: str, style: str):
             response_body = json.loads(response.get("body").read())
             if "images" in response_body and response_body["images"]:
                 image_bytes = base64.b64decode(response_body["images"][0])
-                return image_bytes, "Amazon Bedrock (Titan Image Generator v2)"
+                return image_bytes, "Amazon Bedrock (Nova Canvas)"
         except Exception as e:
             st.error(f"Aviso de AWS Bedrock: {str(e)}")
 
-    # 2. Respaldo automático
+    # 2. Respaldo automático de difusión
     encoded = urllib.parse.quote(full_prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&model=turbo&nologo=true&seed={random_seed}"
     try:
@@ -181,7 +181,7 @@ with st.sidebar:
     
     st.info(f"**Permisos actuales ({role}):**")
     if role == "Diseñador":
-        st.write("- Generación visual con Stable Diffusion / Titan\n- Consulta y descarga de galería\n- Agregar notas creativas")
+        st.write("- Generación visual con Nova Canvas\n- Consulta y descarga de galería\n- Agregar notas creativas")
     elif role == "Redactor":
         st.write("- Transformación de contenido con Claude\n- Control de versiones y rollback\n- Agregar comentarios")
     elif role == "Aprobador":
@@ -233,7 +233,7 @@ with tab_img:
             btn_gen = st.button("🚀 Generar Imagen", use_container_width=True)
 
         if btn_gen and prompt_input:
-            with st.spinner(f"Generando en estilo {style.upper()} con Bedrock..."):
+            with st.spinner(f"Generando con Amazon Bedrock en estilo {style.upper()}..."):
                 img_bytes, engine_used = generate_real_image(prompt_input, style)
                 if img_bytes:
                     st.session_state.image_gallery.append({
