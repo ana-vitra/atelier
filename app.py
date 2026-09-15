@@ -71,83 +71,60 @@ STYLE_PROMPTS = {
 }
 
 # ==============================================================================
-# MÓDULO 1: GENERADOR DE IMÁGENES
+# MÓDULO 1: GENERADOR DE IMÁGENES (AMAZON BEDROCK DIRECTO)
 # ==============================================================================
 def generate_real_image(prompt: str, style: str):
     style_modifier = STYLE_PROMPTS.get(style, "")
     full_prompt = f"{prompt}, {style_modifier}"
     random_seed = random.randint(1000, 9999999)
 
-    # 1. Invocación a Amazon Bedrock con modelos vigentes (SD3 y Titan)
+    # 1. Llamada a Amazon Bedrock (Titan Image Generator v2 en us-east-1)
     if bedrock_client:
-        modern_bedrock_models = [
-            ("stability.sd3-large-v1:0", {
-                "prompt": full_prompt,
-                "mode": "text-to-image",
-                "aspect_ratio": "16:9",
-                "output_format": "png"
-            }),
-            ("stability.stable-image-core-v1:0", {
-                "prompt": full_prompt,
-                "mode": "text-to-image",
-                "aspect_ratio": "16:9",
-                "output_format": "png"
-            }),
-            ("amazon.titan-image-generator-v2:0", {
+        try:
+            payload = {
                 "taskType": "TEXT_IMAGE",
-                "textToImageParams": {"text": full_prompt},
+                "textToImageParams": {
+                    "text": full_prompt[:512]  # Límite admitido por Titan
+                },
                 "imageGenerationConfig": {
                     "numberOfImages": 1,
                     "height": 512,
-                    "width": 768,
+                    "width": 512,  # Resolución exacta requerida por Titan
                     "cfgScale": 8.0
                 }
-            })
-        ]
+            }
+            response = bedrock_client.invoke_model(
+                modelId="amazon.titan-image-generator-v2:0",
+                body=json.dumps(payload),
+                contentType="application/json",
+                accept="application/json"
+            )
+            response_body = json.loads(response.get("body").read())
+            if "images" in response_body and response_body["images"]:
+                image_bytes = base64.b64decode(response_body["images"][0])
+                return image_bytes, "Amazon Bedrock (Titan Image Generator v2)"
+        except Exception as e:
+            st.error(f"Aviso de AWS Bedrock: {str(e)}")
 
-        for model_id, payload in modern_bedrock_models:
-            try:
-                response = bedrock_client.invoke_model(
-                    modelId=model_id,
-                    body=json.dumps(payload),
-                    contentType="application/json",
-                    accept="application/json"
-                )
-                response_body = json.loads(response.get("body").read())
-                
-                images = response_body.get("images", [])
-                if not images and "artifacts" in response_body:
-                    images = [art.get("base64") for art in response_body["artifacts"]]
-                
-                if images:
-                    return base64.b64decode(images[0]), f"Amazon Bedrock ({model_id})"
-            except Exception:
-                continue
-
-    # 2. Motor secundario en vivo (si Bedrock requiere cuota o suscripción previa de marketplace)
+    # 2. Respaldo automático
     encoded = urllib.parse.quote(full_prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&model=turbo&nologo=true&seed={random_seed}"
-    
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=35) as resp:
             return resp.read(), "Stable Diffusion en vivo"
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            return None, "Error 429: El servidor libre está saturado temporalmente. Espera 15 segundos para reintentar."
-        return None, f"Error HTTP: {str(e)}"
     except Exception as e:
         return None, f"Error al generar: {str(e)}"
 
 # ==============================================================================
-# MÓDULO 2: EDICIÓN DE CONTENIDO (CLAUDE 3.5 / SONNET EN BEDROCK)
+# MÓDULO 2: EDICIÓN DE CONTENIDO (CLAUDE EN BEDROCK)
 # ==============================================================================
 def process_text_with_claude(text: str, operation: str, extra_instruction: str = ""):
     system_prompts = {
         "Resumir": "Eres un redactor publicitario senior. Resume el texto destacando la propuesta de valor clave en un formato conciso y persuasivo.",
         "Expandir": "Eres un redactor creativo senior. Desarrolla las ideas proporcionando argumentos comerciales convincentes, llamado a la acción (CTA) y tono envolvente.",
         "Corregir estilo y gramática": "Eres un editor editorial profesional. Corrige errores gramaticales, fluidez y tono profesional sin perder el mensaje esencial.",
-        "Generar variaciones de Copy (A/B)": "Eres especialista en conversión. Genera 3 variaciones de copy: 1) Emocional, 2) Beneficios, 3) Directa con llamado a la acción."
+        "Generar variaciones de Copy (A/B)": "Eres especialista en conversión publicitaria. Genera 3 variaciones de copy: 1) Emocional, 2) Beneficios, 3) Directa con llamado a la acción."
     }
 
     user_prompt = f"Texto base:\n\"\"\"\n{text}\n\"\"\"\n"
@@ -182,9 +159,8 @@ def process_text_with_claude(text: str, operation: str, extra_instruction: str =
             except Exception:
                 continue
 
-    # Modo de respaldo contextual
     if operation == "Resumir":
-        return f"💡 **Resumen Ejecutivo:**\n{text[:130]}... [Propuesta optimizada para anuncios digitales y redes sociales]."
+        return f"💡 **Resumen Ejecutivo:**\n{text[:130]}... [Propuesta condensada para campañas publicitarias digitales]."
     elif operation == "Expandir":
         return f"🚀 **Versión Expandida de Campaña:**\n{text}\n\nEn un entorno saturado de opciones, esta propuesta entrega valor real y sostenible. Diseñado pensando en la durabilidad, cada detalle ha sido optimizado para superar expectativas. ¡Súmate al cambio hoy mismo!"
     elif operation == "Corregir estilo y gramática":
@@ -205,7 +181,7 @@ with st.sidebar:
     
     st.info(f"**Permisos actuales ({role}):**")
     if role == "Diseñador":
-        st.write("- Generación visual con Stable Diffusion\n- Consulta y descarga de galería\n- Agregar notas creativas")
+        st.write("- Generación visual con Stable Diffusion / Titan\n- Consulta y descarga de galería\n- Agregar notas creativas")
     elif role == "Redactor":
         st.write("- Transformación de contenido con Claude\n- Control de versiones y rollback\n- Agregar comentarios")
     elif role == "Aprobador":
@@ -240,7 +216,7 @@ tab_img, tab_txt, tab_collab, tab_sec = st.tabs([
 # PESTAÑA 1: GENERACIÓN DE IMÁGENES
 # ------------------------------------------------------------------------------
 with tab_img:
-    st.header("Generación de Activos Visuales (Stable Diffusion)")
+    st.header("Generación de Activos Visuales (Amazon Bedrock)")
     if role in ["Diseñador", "Administrador"]:
         col1, col2 = st.columns(2)
         with col1:
@@ -257,7 +233,7 @@ with tab_img:
             btn_gen = st.button("🚀 Generar Imagen", use_container_width=True)
 
         if btn_gen and prompt_input:
-            with st.spinner(f"Generando en estilo {style.upper()}... (5 a 8 segundos)"):
+            with st.spinner(f"Generando en estilo {style.upper()} con Bedrock..."):
                 img_bytes, engine_used = generate_real_image(prompt_input, style)
                 if img_bytes:
                     st.session_state.image_gallery.append({
@@ -311,7 +287,7 @@ with tab_txt:
             )
             extra_instructions = st.text_input("Instrucciones específicas (opcional):", placeholder="Ej. Tono fresco para redes sociales")
             if st.button("✨ Aplicar Transformación con Claude", use_container_width=True):
-                with st.spinner("Procesando texto con IA..."):
+                with st.spinner("Procesando texto con Amazon Bedrock..."):
                     result_text = process_text_with_claude(input_text, op, extra_instructions)
                     st.session_state.text_history.append({
                         "version": len(st.session_state.text_history) + 1,
