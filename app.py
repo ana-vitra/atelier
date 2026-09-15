@@ -40,18 +40,18 @@ if "current_user_role" not in st.session_state:
 # ==============================================================================
 has_secrets = "AWS_ACCESS_KEY_ID" in st.secrets and "AWS_SECRET_ACCESS_KEY" in st.secrets
 
-def get_bedrock_client():
+def get_bedrock_client(region="us-west-2"):
     try:
         import boto3
         if has_secrets:
             client = boto3.client(
                 service_name="bedrock-runtime",
-                region_name=st.secrets.get("AWS_DEFAULT_REGION", "us-east-1"),
+                region_name=region,
                 aws_access_key_id=st.secrets["AWS_ACCESS_KEY_ID"],
                 aws_secret_access_key=st.secrets["AWS_SECRET_ACCESS_KEY"]
             )
             return client, "🟢 Conectado a AWS Bedrock (Secrets)"
-        client = boto3.client(service_name="bedrock-runtime", region_name="us-east-1")
+        client = boto3.client(service_name="bedrock-runtime", region_name=region)
         return client, "🟢 Conectado a AWS Bedrock (Local)"
     except Exception:
         return None, "🟡 Modo Directo (Stable Diffusion Online)"
@@ -71,42 +71,46 @@ STYLE_PROMPTS = {
 }
 
 # ==============================================================================
-# MÓDULO 1: GENERADOR DE IMÁGENES (AMAZON BEDROCK NOVA CANVAS)
+# MÓDULO 1: GENERADOR DE IMÁGENES (STABLE DIFFUSION ACTIVO EN BEDROCK)
 # ==============================================================================
 def generate_real_image(prompt: str, style: str):
     style_modifier = STYLE_PROMPTS.get(style, "")
     full_prompt = f"{prompt}, {style_modifier}"
     random_seed = random.randint(1000, 9999999)
 
-    # 1. Llamada al motor vigente de AWS Bedrock: Amazon Nova Canvas
+    # 1. Llamada a los modelos activos vigentes de Bedrock (us-west-2)
     if bedrock_client:
-        try:
-            payload = {
-                "taskType": "TEXT_IMAGE",
-                "textToImageParams": {
-                    "text": full_prompt[:512]
-                },
-                "imageGenerationConfig": {
-                    "numberOfImages": 1,
-                    "height": 512,
-                    "width": 512,
-                    "cfgScale": 8.0
-                }
-            }
-            response = bedrock_client.invoke_model(
-                modelId="amazon.nova-canvas-v1:0",
-                body=json.dumps(payload),
-                contentType="application/json",
-                accept="application/json"
-            )
-            response_body = json.loads(response.get("body").read())
-            if "images" in response_body and response_body["images"]:
-                image_bytes = base64.b64decode(response_body["images"][0])
-                return image_bytes, "Amazon Bedrock (Nova Canvas)"
-        except Exception as e:
-            st.error(f"Aviso de AWS Bedrock: {str(e)}")
+        active_bedrock_models = [
+            "stability.sd3-5-large-v1:0",       # Stable Diffusion 3.5 Large (Activo)
+            "stability.stable-image-core-v1:1",  # Stable Image Core v1.1 (Activo)
+            "stability.stable-image-ultra-v1:1"  # Stable Image Ultra v1.1 (Activo)
+        ]
 
-    # 2. Respaldo automático de difusión
+        payload = {
+            "prompt": full_prompt,
+            "mode": "text-to-image",
+            "aspect_ratio": "1:1",
+            "output_format": "png"
+        }
+
+        for model_id in active_bedrock_models:
+            try:
+                response = bedrock_client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(payload),
+                    contentType="application/json",
+                    accept="application/json"
+                )
+                response_body = json.loads(response.get("body").read())
+                images = response_body.get("images", [])
+                if images:
+                    image_bytes = base64.b64decode(images[0])
+                    return image_bytes, f"Amazon Bedrock ({model_id})"
+            except Exception as e:
+                # Si algún modelo requiere suscripción de Marketplace, prueba el siguiente
+                continue
+
+    # 2. Respaldo de alta fidelidad si la cuenta es nueva y no tiene activado Marketplace
     encoded = urllib.parse.quote(full_prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=512&model=turbo&nologo=true&seed={random_seed}"
     try:
@@ -181,7 +185,7 @@ with st.sidebar:
     
     st.info(f"**Permisos actuales ({role}):**")
     if role == "Diseñador":
-        st.write("- Generación visual con Nova Canvas\n- Consulta y descarga de galería\n- Agregar notas creativas")
+        st.write("- Generación visual con Stable Diffusion 3.5\n- Consulta y descarga de galería\n- Agregar notas creativas")
     elif role == "Redactor":
         st.write("- Transformación de contenido con Claude\n- Control de versiones y rollback\n- Agregar comentarios")
     elif role == "Aprobador":
@@ -216,7 +220,7 @@ tab_img, tab_txt, tab_collab, tab_sec = st.tabs([
 # PESTAÑA 1: GENERACIÓN DE IMÁGENES
 # ------------------------------------------------------------------------------
 with tab_img:
-    st.header("Generación de Activos Visuales (Amazon Bedrock)")
+    st.header("Generación de Activos Visuales (Stable Diffusion en Bedrock)")
     if role in ["Diseñador", "Administrador"]:
         col1, col2 = st.columns(2)
         with col1:
@@ -233,7 +237,7 @@ with tab_img:
             btn_gen = st.button("🚀 Generar Imagen", use_container_width=True)
 
         if btn_gen and prompt_input:
-            with st.spinner(f"Generando con Amazon Bedrock en estilo {style.upper()}..."):
+            with st.spinner(f"Generando en estilo {style.upper()}..."):
                 img_bytes, engine_used = generate_real_image(prompt_input, style)
                 if img_bytes:
                     st.session_state.image_gallery.append({
